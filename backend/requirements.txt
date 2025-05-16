@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+boto3
+GitPython
+python-dotenv
