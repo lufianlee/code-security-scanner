@@ -73,42 +73,51 @@ export default function HomePage() {
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
+      let buffer = '';
 
       const processStream = async () => {
         while (true) {
           const { done, value } = await reader.read();
           if (done) {
+            if (buffer.trim() !== '') {
+              const messages = buffer.split('\n\n');
+              buffer = '';
+              messages.forEach(processMessage);
+            }
             setIsStreamFinished(true);
             break;
           }
 
-          const chunk = decoder.decode(value, { stream: true });
-          const sseMessages = chunk.split('\n\n').filter(msg => msg.trim() !== '');
+          buffer += decoder.decode(value, { stream: true });
+          const sseMessages = buffer.split('\n\n');
+          buffer = sseMessages.pop() || '';
 
-          sseMessages.forEach(sseMessage => {
-            if (sseMessage.startsWith('data:')) {
-              try {
-                const jsonData = sseMessage.substring(5).trim();
-                const parsedEvent = JSON.parse(jsonData) as ProgressMessage;
-                
-                setProgressMessages(prev => [...prev, { 
-                  id: messageIdCounter++, 
-                  type: parsedEvent.type,
-                  payload: parsedEvent.payload
-                }]);
+          sseMessages.forEach(processMessage);
+        }
+      };
 
-                if (parsedEvent.type === 'done') {
-                  setIsStreamFinished(true);
-                }
-                if (parsedEvent.type === 'critical_error') {
-                  setError(`Backend Error: ${parsedEvent.payload}`);
-                  setIsStreamFinished(true);
-                }
-              } catch (e) {
-                console.error('Failed to parse SSE message:', sseMessage, e);
-              }
+      const processMessage = (sseMessage: string) => {
+        if (sseMessage.startsWith('data:')) {
+          try {
+            const jsonData = sseMessage.substring(5).trim();
+            const parsedEvent = JSON.parse(jsonData) as ProgressMessage;
+
+            setProgressMessages(prev => [...prev, {
+              id: messageIdCounter++,
+              type: parsedEvent.type,
+              payload: parsedEvent.payload
+            }]);
+
+            if (parsedEvent.type === 'done') {
+              setIsStreamFinished(true);
             }
-          });
+            if (parsedEvent.type === 'critical_error') {
+              setError(`Backend Error: ${parsedEvent.payload}`);
+              setIsStreamFinished(true);
+            }
+          } catch (e) {
+            console.error('Failed to parse SSE message:', sseMessage, e);
+          }
         }
       };
 
