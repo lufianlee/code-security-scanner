@@ -3,125 +3,61 @@ import shutil
 import tempfile
 import json
 import asyncio
-from fastapi import FastAPI, HTTPException
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urlparse, urlunparse
+
+import anthropic
+from anthropic import AnthropicBedrockMantle
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import boto3
 from git import Repo
 from dotenv import load_dotenv
-from typing import Optional # Added for Optional access_token
-from urllib.parse import urlparse, urlunparse # Added for URL manipulation
-from pathlib import Path
 
 # Load environment variables from .env file
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
-# Validate required environment variables
-required_env_vars = ['AWS_REGION_NAME', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY']
-missing_vars = [var for var in required_env_vars if not os.getenv(var)]
-if missing_vars:
-    raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+AWS_REGION = os.getenv("AWS_REGION_NAME") or os.getenv("AWS_REGION")
+if not AWS_REGION:
+    raise ValueError("Missing required environment variable: AWS_REGION_NAME (or AWS_REGION)")
 
-app = FastAPI()
+# AWS access keys are optional: boto3's default credential chain
+# (env vars, ~/.aws/credentials, IAM role) is used when they are not set.
+MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-sonnet-5")
+MAX_FILE_SIZE_BYTES = int(os.getenv("MAX_FILE_SIZE_BYTES", str(200 * 1024)))
+MAX_ANALYSIS_TOKENS = 8192
 
-# CORS Middleware
-origins = [
-    "http://localhost:3000",
+SCAN_EXTENSIONS = (
+    '.py', '.js', '.jsx', '.java', '.rb', '.php', '.go', '.ts', '.tsx',
+    '.c', '.cpp', '.cs', '.kt', '.swift', '.html', '.css',
+)
+SKIP_DIRS = {
+    '.git', 'node_modules', 'vendor', 'dist', 'build', '.next',
+    '__pycache__', '.venv', 'venv', 'target', 'coverage',
+}
+
+app = FastAPI(title="Code Security Scanner API")
+
+allowed_origins = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    if origin.strip()
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Kept as ["*"] for now to avoid blocking PAT testing due to potential CORS issues. Will remind to restrict later.
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-bedrock_runtime = boto3.client(
-    service_name='bedrock-runtime',
-    region_name=os.getenv("AWS_REGION_NAME"),
-    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-    endpoint_url=f"https://bedrock-runtime.{os.getenv('AWS_REGION_NAME')}.amazonaws.com"
-)
+bedrock_client = AnthropicBedrockMantle(aws_region=AWS_REGION)
 
-MODEL_ID = "anthropic.claude-3-5-sonnet-20240620-v1:0"
-
-class RepositoryScanRequest(BaseModel):
-    repository_url: str
-    access_token: Optional[str] = None # Added PAT field
-
-def construct_authenticated_url(repo_url: str, token: Optional[str]) -> str:
-    if not token:
-        return repo_url
-
-    parsed_url = urlparse(repo_url)
-    if not parsed_url.scheme or not parsed_url.netloc:
-        # Not a valid URL to easily inject token, return original or raise error
-        # For simplicity, returning original; robust error handling could be added
-        return repo_url
-
-    # Ensure path starts with a slash if it's not empty
-    path = parsed_url.path
-    if path and not path.startswith('/'):
-        path = '/' + path
-    
-    if "github.com" in parsed_url.netloc.lower():
-        # For GitHub, format is https://<token>@github.com/owner/repo.git
-        # Or, some prefer https://x-access-token:<token>@github.com/...
-        # Using the simpler <token>@ form for now.
-        authenticated_netloc = f"{token}@{parsed_url.netloc}"
-    elif "bitbucket.org" in parsed_url.netloc.lower():
-        # For Bitbucket, format is https://x-token-auth:<token>@bitbucket.org/owner/repo.git
-        authenticated_netloc = f"x-token-auth:{token}@{parsed_url.netloc}"
-    else:
-        # Generic approach for other providers, may need adjustment
-        # This assumes the token can be used as a username.
-        authenticated_netloc = f"{token}@{parsed_url.netloc}"
-        
-    return urlunparse((parsed_url.scheme, authenticated_netloc, path, parsed_url.params, parsed_url.query, parsed_url.fragment))
-
-
-async def stream_scan_events(repo_url: str, access_token: Optional[str]): # Added access_token parameter
-    temp_dir = None
-    try:
-        authenticated_repo_url = construct_authenticated_url(repo_url, access_token)
-        
-        display_url = repo_url if not access_token else "provided URL with token"
-        yield f"data: {json.dumps({'type': 'status', 'payload': f'Cloning repository from {display_url}...'})}\n\n"
-        await asyncio.sleep(0.1)
-
-        temp_dir = tempfile.mkdtemp()
-        Repo.clone_from(authenticated_repo_url, temp_dir) # Use authenticated URL
-        yield f"data: {json.dumps({'type': 'status', 'payload': 'Repository cloned successfully.'})}\n\n"
-        await asyncio.sleep(0.1)
-
-        vulnerabilities_found_overall = False
-        scanned_files_count = 0
-
-        for subdir, dirs, files in os.walk(temp_dir):
-            for file_name in files:
-                if file_name.endswith(('.py', '.js', '.java', '.rb', '.php', '.go', '.ts', '.tsx', '.html', '.css')):
-                    file_path = os.path.join(subdir, file_name)
-                    relative_file_path = os.path.relpath(file_path, temp_dir)
-                    
-                    yield f"data: {json.dumps({'type': 'progress', 'payload': f'Scanning file: {relative_file_path}'})}\n\n"
-                    await asyncio.sleep(0.1)
-                    scanned_files_count += 1
-
-                    try:
-                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                            content = f.read()
-                        
-                        if not content.strip():
-                            yield f"data: {json.dumps({'type': 'info', 'payload': f'Skipping empty file: {relative_file_path}'})}\n\n"
-                            await asyncio.sleep(0.1)
-                            continue
-                        
-                        prompt = f"""<|im_start|>system
-You are a security expert analyzing code for vulnerabilities. For each vulnerability found, provide:
+SYSTEM_PROMPT = """You are a security expert analyzing code for vulnerabilities. For each vulnerability found, provide:
 1. File name
 2. Line number (if applicable)
 3. Description of the vulnerability
@@ -129,71 +65,155 @@ You are a security expert analyzing code for vulnerabilities. For each vulnerabi
 5. Recommended fix
 
 If no vulnerabilities are found, simply state "No vulnerabilities found in this file."
-<|im_end|>
+"""
 
-<|im_start|>user
-Analyze the following code for security vulnerabilities:
 
-File: {relative_file_path}
-Code:
-```
-{content}
-```
+class RepositoryScanRequest(BaseModel):
+    repository_url: str
+    access_token: Optional[str] = None
 
-Assistant:"""
-                        
-                        request_body = {
-                            "anthropic_version": "bedrock-2023-05-31",
-                            "max_tokens": 4096,
-                            "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-                        }
-                        
-                        response = bedrock_runtime.invoke_model(
-                            modelId=MODEL_ID,
-                            body=json.dumps(request_body)
-                        )
-                        
-                        response_body = json.loads(response.get('body').read())
-                        analysis_result = response_body.get('content', [{}])[0].get('text', '')
 
-                        if analysis_result and "No vulnerabilities found" not in analysis_result:
-                            vulnerabilities_found_overall = True
-                            yield f"data: {json.dumps({'type': 'vulnerability', 'payload': {'file': relative_file_path, 'analysis': analysis_result}})}\n\n"
-                            await asyncio.sleep(0.1)
-                        else:
-                            yield f"data: {json.dumps({'type': 'info', 'payload': f'No vulnerabilities found in: {relative_file_path}'})}\n\n"
-                            await asyncio.sleep(0.1)
+def redact_token(text: str, token: Optional[str]) -> str:
+    """Prevent the access token from leaking into log or SSE error output."""
+    if token:
+        return text.replace(token, "***")
+    return text
 
-                    except Exception as e:
-                        error_message = f"Error processing file {relative_file_path}: {str(e)}"
-                        print(error_message)
-                        yield f"data: {json.dumps({'type': 'error', 'payload': error_message})}\n\n"
-                        await asyncio.sleep(0.1)
-        
+
+def construct_authenticated_url(repo_url: str, token: Optional[str]) -> str:
+    parsed_url = urlparse(repo_url)
+    if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
+        raise ValueError("Repository URL must be a valid http(s) URL.")
+
+    if not token:
+        return repo_url
+
+    host = parsed_url.netloc.lower()
+    if "github.com" in host:
+        authenticated_netloc = f"x-access-token:{token}@{parsed_url.netloc}"
+    elif "bitbucket.org" in host:
+        authenticated_netloc = f"x-token-auth:{token}@{parsed_url.netloc}"
+    else:
+        authenticated_netloc = f"{token}@{parsed_url.netloc}"
+
+    return urlunparse((
+        parsed_url.scheme, authenticated_netloc, parsed_url.path,
+        parsed_url.params, parsed_url.query, parsed_url.fragment,
+    ))
+
+
+def analyze_code(relative_file_path: str, content: str) -> str:
+    response = bedrock_client.messages.create(
+        model=MODEL_ID,
+        max_tokens=MAX_ANALYSIS_TOKENS,
+        system=SYSTEM_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": (
+                "Analyze the following code for security vulnerabilities:\n\n"
+                f"File: {relative_file_path}\n"
+                f"Code:\n```\n{content}\n```"
+            ),
+        }],
+    )
+    if response.stop_reason == "refusal":
+        return "Analysis was declined by the model's safety system for this file."
+    return "".join(block.text for block in response.content if block.type == "text")
+
+
+def iter_scannable_files(root_dir: str):
+    for subdir, dirs, files in os.walk(root_dir):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for file_name in files:
+            if file_name.endswith(SCAN_EXTENSIONS):
+                yield os.path.join(subdir, file_name)
+
+
+def sse_event(event_type: str, payload) -> str:
+    return f"data: {json.dumps({'type': event_type, 'payload': payload})}\n\n"
+
+
+async def stream_scan_events(repo_url: str, access_token: Optional[str]):
+    temp_dir = None
+    try:
+        authenticated_repo_url = construct_authenticated_url(repo_url, access_token)
+
+        display_url = repo_url if not access_token else "provided URL (token redacted)"
+        yield sse_event('status', f'Cloning repository from {display_url}...')
+
+        temp_dir = tempfile.mkdtemp()
+        # Shallow clone in a worker thread so the event loop is not blocked.
+        await asyncio.to_thread(Repo.clone_from, authenticated_repo_url, temp_dir, depth=1)
+        yield sse_event('status', 'Repository cloned successfully.')
+
+        vulnerabilities_found_overall = False
+        scanned_files_count = 0
+
+        for file_path in iter_scannable_files(temp_dir):
+            relative_file_path = os.path.relpath(file_path, temp_dir)
+            yield sse_event('progress', f'Scanning file: {relative_file_path}')
+            scanned_files_count += 1
+
+            try:
+                if os.path.getsize(file_path) > MAX_FILE_SIZE_BYTES:
+                    yield sse_event('info', f'Skipping large file (> {MAX_FILE_SIZE_BYTES // 1024}KB): {relative_file_path}')
+                    continue
+
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+
+                if not content.strip():
+                    yield sse_event('info', f'Skipping empty file: {relative_file_path}')
+                    continue
+
+                analysis_result = await asyncio.to_thread(analyze_code, relative_file_path, content)
+
+                if analysis_result and "No vulnerabilities found" not in analysis_result:
+                    vulnerabilities_found_overall = True
+                    yield sse_event('vulnerability', {'file': relative_file_path, 'analysis': analysis_result})
+                else:
+                    yield sse_event('info', f'No vulnerabilities found in: {relative_file_path}')
+
+            except anthropic.RateLimitError:
+                yield sse_event('error', f'Rate limited while analyzing {relative_file_path}. Waiting before retrying next file...')
+                await asyncio.sleep(10)
+            except anthropic.APIStatusError as e:
+                yield sse_event('error', f'Model API error ({e.status_code}) while analyzing {relative_file_path}.')
+            except Exception as e:
+                error_message = redact_token(f"Error processing file {relative_file_path}: {e}", access_token)
+                print(error_message)
+                yield sse_event('error', error_message)
+
         if scanned_files_count == 0:
-            yield f"data: {json.dumps({'type': 'status', 'payload': 'No supported files found to scan in the repository.'})}\n\n"
+            yield sse_event('status', 'No supported files found to scan in the repository.')
         elif not vulnerabilities_found_overall:
-             yield f"data: {json.dumps({'type': 'status', 'payload': 'Scan complete. No vulnerabilities found in supported files.'})}\n\n"
+            yield sse_event('status', 'Scan complete. No vulnerabilities found in supported files.')
         else:
-            yield f"data: {json.dumps({'type': 'status', 'payload': 'Scan complete. Vulnerabilities were found.'})}\n\n"
-        await asyncio.sleep(0.1)
+            yield sse_event('status', 'Scan complete. Vulnerabilities were found.')
 
     except Exception as e:
-        error_detail = f"An unexpected error occurred during scanning: {str(e)}"
+        error_detail = redact_token(f"An unexpected error occurred during scanning: {e}", access_token)
         print(error_detail)
-        yield f"data: {json.dumps({'type': 'critical_error', 'payload': error_detail})}\n\n"
-        await asyncio.sleep(0.1)
+        yield sse_event('critical_error', error_detail)
     finally:
         if temp_dir and os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-            yield f"data: {json.dumps({'type': 'status', 'payload': 'Cleaned up temporary files.'})}\n\n"
-            await asyncio.sleep(0.1)
-        
-        yield f"data: {json.dumps({'type': 'done', 'payload': 'Process finished.'})}\n\n"
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            yield sse_event('status', 'Cleaned up temporary files.')
+
+        yield sse_event('done', 'Process finished.')
+
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "model": MODEL_ID}
+
 
 @app.post("/scan_repository")
-async def scan_repository_endpoint(request: RepositoryScanRequest): # Request model now includes access_token
-    return StreamingResponse(stream_scan_events(request.repository_url, request.access_token), media_type="text/event-stream") # Pass token
+async def scan_repository_endpoint(request: RepositoryScanRequest):
+    return StreamingResponse(
+        stream_scan_events(request.repository_url, request.access_token),
+        media_type="text/event-stream",
+    )
 
 # To run the app (from the 'backend' directory):
 # uvicorn main:app --reload

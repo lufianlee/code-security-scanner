@@ -73,6 +73,9 @@ export default function HomePage() {
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
+      // SSE messages can be split across network chunks, so buffer partial
+      // data until a full "\n\n"-terminated message has arrived.
+      let buffer = '';
 
       const processStream = async () => {
         while (true) {
@@ -82,8 +85,10 @@ export default function HomePage() {
             break;
           }
 
-          const chunk = decoder.decode(value, { stream: true });
-          const sseMessages = chunk.split('\n\n').filter(msg => msg.trim() !== '');
+          buffer += decoder.decode(value, { stream: true });
+          const parts = buffer.split('\n\n');
+          buffer = parts.pop() ?? '';
+          const sseMessages = parts.filter(msg => msg.trim() !== '');
 
           sseMessages.forEach(sseMessage => {
             if (sseMessage.startsWith('data:')) {
